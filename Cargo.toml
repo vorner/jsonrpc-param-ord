@@ -1,11 +1,5 @@
-[package]
-name = "jsonrpc-param-ord"
-version = "0.1.0"
-authors = ["Michal 'vorner' Vaner <vorner@vorner.cz>"]
-
-[dependencies]
-error-chain = "~0.10"
-serde = "~1"
-serde_derive = "~1"
-serde_json = "~1"
-regex = "~0.2"
+[workspace]
+members = [
+"jsonrpc-param-ord",
+"compile-commands-post",
+]
