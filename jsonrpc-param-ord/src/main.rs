@@ -1,9 +1,9 @@
 #[macro_use]
 extern crate error_chain;
 extern crate regex;
-extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+#[macro_use]
 extern crate serde_json;
 
 use std::io::{self, BufRead, Read, Write};
@@ -51,7 +51,29 @@ fn run() -> Result<()> {
             .parse::<usize>()?;
         let mut data = vec![0u8; size];
         input.read_exact(&mut data)?;
-        if let Ok(value) = serde_json::from_slice::<Call>(&data) {
+        if let Ok(mut value) = serde_json::from_slice::<Call>(&data) {
+            let meta = if value.method == "textDocument/didOpen" {
+                let lang_id = value.params
+                    .as_ref()
+                    .and_then(|p| p.pointer("/textDocument/languageId"))
+                    .and_then(Value::as_str);
+                eprintln!("lagID: {:?}", lang_id);
+                match lang_id {
+                    Some("c") => Some("--std=gnu99"),
+                    Some("cpp") => Some("--std=c++1z"),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(meta) = meta {
+                let meta = vec![meta, "-Wall", "-Wextra", "-pedantic"];
+                value.params
+                    .as_mut()
+                    .and_then(Value::as_object_mut)
+                    .unwrap()
+                    .insert("metadata".to_owned(), json!({"extraFlags": meta}));
+            }
             let data = serde_json::to_vec(&value)?;
             let output = io::stdout();
             let mut output = output.lock();
