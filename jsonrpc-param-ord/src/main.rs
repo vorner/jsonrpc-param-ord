@@ -67,7 +67,14 @@ fn run() -> Result<()> {
                 None
             };
             if let Some(meta) = meta {
-                let meta = vec![meta, "-Wall", "-Wextra", "-pedantic"];
+                let meta = vec![
+                    meta,
+                    "-Wall",
+                    "-Wextra",
+                    "-pedantic",
+                    "-DUNIT_TESTS=1",
+                    "-I/usr/include/catch"
+                ];
                 value.params
                     .as_mut()
                     .and_then(Value::as_object_mut)
