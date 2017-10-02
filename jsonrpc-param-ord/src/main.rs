@@ -3,6 +3,8 @@ extern crate bytes;
 #[macro_use]
 extern crate error_chain;
 extern crate futures_await as futures;
+#[macro_use]
+extern crate lazy_static;
 extern crate regex;
 #[macro_use]
 extern crate serde_derive;
@@ -10,20 +12,19 @@ extern crate serde_derive;
 extern crate serde_json;
 extern crate tokio_core;
 extern crate tokio_io;
-extern crate tokio_stdio;
+extern crate tokio_file_unix;
 
 use std::io::{self, Cursor, BufRead, ErrorKind as IoErrorKind, Result as IoResult};
 use std::num::ParseIntError;
 
 use bytes::BytesMut;
-use futures::{Sink, Stream};
+use futures::Sink;
 use futures::prelude::*;
 use regex::Regex;
 use serde_json::Value;
-use tokio_core::reactor::Core;
-use tokio_io::AsyncRead;
-use tokio_io::codec::{Decoder, Encoder};
-use tokio_stdio::stdio::Stdio;
+use tokio_core::reactor::{Core, Handle};
+use tokio_io::codec::{Decoder, Encoder, FramedRead, FramedWrite};
+use tokio_file_unix::{File as TokioFile, StdFile};
 
 error_chain! {
     foreign_links {
@@ -109,11 +110,19 @@ impl Decoder for ContentLengthPrefixed {
     }
 }
 
+lazy_static! {
+    static ref STDIN: io::Stdin = io::stdin();
+    static ref STDOUT: io::Stdout = io::stdout();
+}
+
 #[async]
-fn run() -> Result<()> {
-    let stdio = Stdio::new(1024, 1024);
-    let parsed = stdio.framed(ContentLengthPrefixed::new());
-    let (mut writer, reader) = parsed.split();
+fn run(handle: Handle) -> Result<()> {
+    let stdin = TokioFile::new_nb(StdFile(STDIN.lock()))?
+        .into_io(&handle)?;
+    let reader = FramedRead::new(stdin, ContentLengthPrefixed::new());
+    let stdout = TokioFile::new_nb(StdFile(STDOUT.lock()))?
+        .into_io(&handle)?;
+    let mut writer = FramedWrite::new(stdout, ContentLengthPrefixed::new());
     #[async]
     for mut call in reader {
         let meta = if call.method == "textDocument/didOpen" {
@@ -151,8 +160,7 @@ fn run() -> Result<()> {
 }
 
 fn main() {
-    Core::new()
-        .unwrap()
-        .run(run())
-        .unwrap();
+    let mut core = Core::new().unwrap();
+    let handle = core.handle();
+    core.run(run(handle)).unwrap();
 }
