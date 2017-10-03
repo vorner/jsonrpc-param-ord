@@ -17,7 +17,7 @@ extern crate tokio_process;
 
 use std::io::{self, Cursor, BufRead, ErrorKind as IoErrorKind, Result as IoResult};
 use std::num::ParseIntError;
-use std::process::{Command, Stdio};
+use std::process::{self, Command, Stdio};
 
 use bytes::BytesMut;
 use futures::Sink;
@@ -210,5 +210,11 @@ fn run(handle: Handle) -> Result<()> {
 fn main() {
     let mut core = Core::new().unwrap();
     let handle = core.handle();
-    core.run(run(handle)).unwrap();
+    match core.run(run(handle)) {
+        Ok(()) => (),
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(1);
+        },
+    }
 }
