@@ -13,9 +13,11 @@ extern crate serde_json;
 extern crate tokio_core;
 extern crate tokio_io;
 extern crate tokio_file_unix;
+extern crate tokio_process;
 
 use std::io::{self, Cursor, BufRead, ErrorKind as IoErrorKind, Result as IoResult};
 use std::num::ParseIntError;
+use std::process::{Command, Stdio};
 
 use bytes::BytesMut;
 use futures::Sink;
@@ -25,6 +27,7 @@ use serde_json::Value;
 use tokio_core::reactor::{Core, Handle};
 use tokio_io::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 use tokio_file_unix::{File as TokioFile, StdFile};
+use tokio_process::CommandExt;
 
 error_chain! {
     foreign_links {
@@ -37,18 +40,28 @@ error_chain! {
             description("Important header missing")
             display("Important header missing")
         }
+        ClangFailed {
+            description("ClangD failed")
+            display("ClangD failed")
+        }
     }
 }
 
 #[derive(Serialize, Deserialize)]
 struct Call {
     jsonrpc: String,
-    method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     params: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<Value>,
 }
+
 
 struct ContentLengthPrefixed {
     re: Regex,
@@ -116,16 +129,14 @@ lazy_static! {
 }
 
 #[async]
-fn run(handle: Handle) -> Result<()> {
-    let stdin = TokioFile::new_nb(StdFile(STDIN.lock()))?
-        .into_io(&handle)?;
-    let reader = FramedRead::new(stdin, ContentLengthPrefixed::new());
-    let stdout = TokioFile::new_nb(StdFile(STDOUT.lock()))?
-        .into_io(&handle)?;
-    let mut writer = FramedWrite::new(stdout, ContentLengthPrefixed::new());
+fn vim2clang<R, W>(reader: R, mut writer: W) -> Result<()>
+where
+    R: Stream<Item = Call, Error = Error> + 'static,
+    W: Sink<SinkItem = Call, SinkError = Error> + 'static,
+{
     #[async]
     for mut call in reader {
-        let meta = if call.method == "textDocument/didOpen" {
+        let meta = if call.method == Some("textDocument/didOpen".to_owned()) {
             let lang_id = call.params
                 .as_ref()
                 .and_then(|p| p.pointer("/textDocument/languageId"))
@@ -157,6 +168,43 @@ fn run(handle: Handle) -> Result<()> {
         writer = await!(writer.send(call))?;
     }
     Ok(())
+}
+
+#[async]
+fn clang2vim<R, W>(reader: R, mut writer: W) -> Result<()>
+where
+    R: Stream<Item = Call, Error = Error> + 'static,
+    W: Sink<SinkItem = Call, SinkError = Error> + 'static,
+{
+    #[async]
+    for response in reader {
+        writer = await!(writer.send(response))?;
+    }
+    Ok(())
+}
+
+#[async]
+fn run(handle: Handle) -> Result<()> {
+    let stdin = TokioFile::new_nb(StdFile(STDIN.lock()))?
+        .into_io(&handle)?;
+    let reader = FramedRead::new(stdin, ContentLengthPrefixed::new());
+    let stdout = TokioFile::new_nb(StdFile(STDOUT.lock()))?
+        .into_io(&handle)?;
+    let writer = FramedWrite::new(stdout, ContentLengthPrefixed::new());
+    let mut clangd = Command::new("clangd")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn_async(&handle)?;
+    let clangd_writer = FramedWrite::new(clangd.stdin().take().unwrap(),
+                                         ContentLengthPrefixed::new());
+    let clangd_reader = FramedRead::new(clangd.stdout().take().unwrap(),
+                                        ContentLengthPrefixed::new());
+    await!(vim2clang(reader, clangd_writer).join(clang2vim(clangd_reader, writer)))?;
+    if await!(clangd)?.success() {
+        Ok(())
+    } else {
+        Err(ErrorKind::ClangFailed.into())
+    }
 }
 
 fn main() {
