@@ -15,12 +15,15 @@ extern crate tokio_io;
 extern crate tokio_file_unix;
 extern crate tokio_process;
 
+use std::cell::RefCell;
 use std::io::{self, Cursor, BufRead, ErrorKind as IoErrorKind, Result as IoResult};
 use std::num::ParseIntError;
 use std::process::{self, Command, Stdio};
+use std::rc::Rc;
 
 use bytes::BytesMut;
 use futures::Sink;
+use futures::unsync::mpsc;
 use futures::prelude::*;
 use regex::Regex;
 use serde_json::Value;
@@ -34,6 +37,7 @@ error_chain! {
         Io(io::Error);
         SerdeJson(serde_json::Error);
         NumParse(ParseIntError);
+        Send(mpsc::SendError<Call>);
     }
     errors {
         HeaderMissing {
@@ -44,11 +48,21 @@ error_chain! {
             description("ClangD failed")
             display("ClangD failed")
         }
+        Unspecified {
+            description("Stupid unspecified () error")
+            display("Stupid unspecified () error")
+        }
+    }
+}
+
+impl From<()> for Error {
+    fn from(_: ()) -> Error {
+        ErrorKind::Unspecified.into()
     }
 }
 
 #[derive(Serialize, Deserialize)]
-struct Call {
+pub struct Call {
     jsonrpc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     method: Option<String>,
@@ -128,14 +142,43 @@ lazy_static! {
     static ref STDOUT: io::Stdout = io::stdout();
 }
 
+struct WaitingChange {
+    call: Option<Call>,
+    waiting: bool,
+}
+
+type Waiting = Rc<RefCell<WaitingChange>>;
+
 #[async]
-fn vim2clang<R, W>(reader: R, mut writer: W) -> Result<()>
+fn vim2clang<R, W>(reader: R, mut writer: W, waiting: Waiting) -> Result<()>
 where
     R: Stream<Item = Call, Error = Error> + 'static,
-    W: Sink<SinkItem = Call, SinkError = Error> + 'static,
+    W: Sink<SinkItem = Call, SinkError = mpsc::SendError<Call>> + 'static,
 {
     #[async]
     for mut call in reader {
+        let mut pre_call = None;
+        if call.method == Some("textDocument/didChange".to_owned()) {
+            let mut borrow = waiting.borrow_mut();
+            // Nothing waiting for an answer, send it through
+            if !borrow.waiting {
+                borrow.waiting = true;
+                eprintln!("Sending right away");
+            } else {
+                // We wait for an answer. Therefore, delay this one (and overwrite any delayed one
+                // if there is).
+                borrow.call = Some(call);
+                eprintln!("Postponing");
+                continue;
+            }
+        } else {
+            let mut borrow = waiting.borrow_mut();
+            pre_call = borrow.call.take();
+        }
+        if let Some(pre) = pre_call {
+            eprintln!("Pre-send");
+            writer = await!(writer.send(pre))?;
+        }
         let meta = if call.method == Some("textDocument/didOpen".to_owned()) {
             let lang_id = call.params
                 .as_ref()
@@ -171,14 +214,33 @@ where
 }
 
 #[async]
-fn clang2vim<R, W>(reader: R, mut writer: W) -> Result<()>
+fn clang2vim<R, VW, CW>(reader: R, mut vim_writer: VW, mut clang_writer: CW, waiting: Waiting)
+    -> Result<()>
 where
     R: Stream<Item = Call, Error = Error> + 'static,
-    W: Sink<SinkItem = Call, SinkError = Error> + 'static,
+    VW: Sink<SinkItem = Call, SinkError = Error> + 'static,
+    CW: Sink<SinkItem = Call, SinkError = mpsc::SendError<Call>> + 'static,
 {
     #[async]
     for response in reader {
-        writer = await!(writer.send(response))?;
+        let mut call = None;
+        if response.method == Some("textDocument/publishDiagnostics".to_owned()) {
+            let mut borrow = waiting.borrow_mut();
+            call = borrow.call.take();
+            if call.is_none() {
+                borrow.waiting = false;
+                eprintln!("Nothing is waiting now");
+            }
+        }
+        let send_vim = vim_writer.send(response);
+        if let Some(call) = call {
+            eprintln!("Sending waiting change");
+            let res = await!(clang_writer.send(call).map_err(Error::from).join(send_vim))?;
+            clang_writer = res.0;
+            vim_writer = res.1;
+        } else {
+            vim_writer = await!(send_vim)?;
+        }
     }
     Ok(())
 }
@@ -199,7 +261,17 @@ fn run(handle: Handle) -> Result<()> {
                                          ContentLengthPrefixed::new());
     let clangd_reader = FramedRead::new(clangd.stdout().take().unwrap(),
                                         ContentLengthPrefixed::new());
-    await!(vim2clang(reader, clangd_writer).join(clang2vim(clangd_reader, writer)))?;
+    let (sender, receiver) = mpsc::channel(1);
+    let forward = clangd_writer.send_all(receiver);
+    let waiting = WaitingChange {
+        call: None,
+        waiting: false,
+    };
+    let waiting = Rc::new(RefCell::new(waiting));
+    let done = vim2clang(reader, sender.clone(), waiting.clone())
+        .join(clang2vim(clangd_reader, writer, sender, waiting))
+        .join(forward);
+    await!(done)?;
     if await!(clangd)?.success() {
         Ok(())
     } else {
