@@ -3,6 +3,7 @@ extern crate bytes;
 #[macro_use]
 extern crate error_chain;
 extern crate futures_await as futures;
+extern crate glob;
 #[macro_use]
 extern crate lazy_static;
 extern crate regex;
@@ -14,9 +15,12 @@ extern crate tokio_core;
 extern crate tokio_io;
 extern crate tokio_file_unix;
 extern crate tokio_process;
+extern crate url;
 
 use std::cell::RefCell;
-use std::io::{self, Cursor, BufRead, ErrorKind as IoErrorKind, Result as IoResult};
+use std::env;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Cursor, ErrorKind as IoErrorKind, Result as IoResult};
 use std::num::ParseIntError;
 use std::process::{self, Command, Stdio};
 use std::rc::Rc;
@@ -25,12 +29,14 @@ use bytes::BytesMut;
 use futures::Sink;
 use futures::unsync::mpsc;
 use futures::prelude::*;
+use glob::Pattern;
 use regex::Regex;
 use serde_json::Value;
 use tokio_core::reactor::{Core, Handle};
 use tokio_io::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 use tokio_file_unix::{File as TokioFile, StdFile};
 use tokio_process::CommandExt;
+use url::Url;
 
 error_chain! {
     foreign_links {
@@ -38,8 +44,18 @@ error_chain! {
         SerdeJson(serde_json::Error);
         NumParse(ParseIntError);
         Send(mpsc::SendError<Call>);
+        Glob(glob::PatternError);
+        Url(url::ParseError);
     }
     errors {
+        NoOptsParam {
+            description("Missing the options file paramater")
+            display("Missing the options file paramater")
+        }
+        OptSyntax(s: &'static str) {
+            description("Syntax error in the opts file")
+            display("Syntax error in the opts file: {}", s)
+        }
         HeaderMissing {
             description("Important header missing")
             display("Important header missing")
@@ -150,7 +166,7 @@ struct WaitingChange {
 type Waiting = Rc<RefCell<WaitingChange>>;
 
 #[async]
-fn vim2clang<R, W>(reader: R, mut writer: W, waiting: Waiting) -> Result<()>
+fn vim2clang<R, W>(reader: R, mut writer: W, waiting: Waiting, opts: Vec<Opts>) -> Result<()>
 where
     R: Stream<Item = Call, Error = Error> + 'static,
     W: Sink<SinkItem = Call, SinkError = mpsc::SendError<Call>> + 'static,
@@ -180,28 +196,34 @@ where
             writer = await!(writer.send(pre))?;
         }
         let meta = if call.method == Some("textDocument/didOpen".to_owned()) {
-            let lang_id = call.params
+            let url = call.params
                 .as_ref()
-                .and_then(|p| p.pointer("/textDocument/languageId"))
+                .and_then(|p| p.pointer("/textDocument/uri"))
                 .and_then(Value::as_str);
-            eprintln!("lagID: {:?}", lang_id);
-            match lang_id {
-                Some("c") => Some("--std=gnu99"),
-                Some("cpp") => Some("--std=c++1z"),
-                _ => None,
+            if let Some(url) = url {
+                let path = Url::parse(url)?.to_file_path().unwrap();
+                eprintln!("URL {:?}/{:?}", url, path);
+                let mut result = Vec::new();
+                for opt in &opts {
+                    if !opt.glob.matches_path(&path) {
+                        continue;
+                    }
+                    eprintln!("Match: {:?}", opt);
+                    let new = opt.opts.iter().cloned();
+                    match opt.mode {
+                        OptsMode::Append => result.extend(new),
+                        OptsMode::Replace => result = new.collect(),
+                    }
+                }
+                Some(result)
+            } else {
+                None
             }
         } else {
             None
         };
         if let Some(meta) = meta {
-            let meta = vec![
-                meta,
-                "-Wall",
-                "-Wextra",
-                "-pedantic",
-                "-DUNIT_TESTS=1",
-                "-I/usr/include/catch"
-            ];
+            eprintln!("Meta: {:?}", meta);
             call.params
                 .as_mut()
                 .and_then(Value::as_object_mut)
@@ -246,7 +268,7 @@ where
 }
 
 #[async]
-fn run(handle: Handle) -> Result<()> {
+fn run(opts: Vec<Opts>, handle: Handle) -> Result<()> {
     let stdin = TokioFile::new_nb(StdFile(STDIN.lock()))?
         .into_io(&handle)?;
     let reader = FramedRead::new(stdin, ContentLengthPrefixed::new());
@@ -268,7 +290,7 @@ fn run(handle: Handle) -> Result<()> {
         waiting: false,
     };
     let waiting = Rc::new(RefCell::new(waiting));
-    let done = vim2clang(reader, sender.clone(), waiting.clone())
+    let done = vim2clang(reader, sender.clone(), waiting.clone(), opts)
         .join(clang2vim(clangd_reader, writer, sender, waiting))
         .join(forward);
     await!(done)?;
@@ -279,10 +301,62 @@ fn run(handle: Handle) -> Result<()> {
     }
 }
 
-fn main() {
-    let mut core = Core::new().unwrap();
+#[derive(Debug)]
+enum OptsMode {
+    Append,
+    Replace,
+}
+
+#[derive(Debug)]
+struct Opts {
+    glob: Pattern,
+    opts: Vec<String>,
+    mode: OptsMode,
+}
+
+fn opts_load() -> Result<Vec<Opts>> {
+    let path = env::args()
+        .nth(1)
+        .ok_or(ErrorKind::NoOptsParam)?;
+    let f = File::open(path)?;
+    let buf = BufReader::new(f);
+    let mut result = Vec::new();
+    for l in buf.lines() {
+        let l = l?;
+        if l.is_empty() {
+            continue;
+        }
+        let mode = match &l[..1] {
+            "+" => OptsMode::Append,
+            "=" => OptsMode::Replace,
+            "#" => continue,
+            _ => bail!(ErrorKind::OptSyntax("Unknown sigil")),
+        };
+        let mut content = l[1..].split_whitespace();
+        let glob = content.next()
+            .map(Pattern::new)
+            .ok_or(ErrorKind::OptSyntax("Missing pattern"))??;
+        let opts = content
+            .map(str::to_owned)
+            .collect();
+        result.push(Opts {
+            glob,
+            opts,
+            mode,
+        });
+    }
+    Ok(result)
+}
+
+fn run_all() -> Result<()> {
+    let opts = opts_load()?;
+    let mut core = Core::new()?;
     let handle = core.handle();
-    match core.run(run(handle)) {
+    core.run(run(opts, handle))
+}
+
+fn main() {
+    match run_all() {
         Ok(()) => (),
         Err(e) => {
             eprintln!("{}", e);
