@@ -136,7 +136,8 @@ impl Decoder for ContentLengthPrefixed {
                     }
                     self.re.captures_iter(&headers)
                         .next()
-                        .ok_or(ErrorKind::HeaderMissing)?[1]
+                        // FIXME: Unwray because we want to kill on eof
+                        .ok_or(ErrorKind::HeaderMissing).unwrap()[1]
                         .parse::<usize>()?
                 },
                 Err(ref e) if e.kind() == IoErrorKind::UnexpectedEof => return Ok(None),
@@ -150,6 +151,10 @@ impl Decoder for ContentLengthPrefixed {
         }
         src.split_to(pos);
         Ok(Some(serde_json::from_slice(&src.split_to(len))?))
+    }
+    fn decode_eof(&mut self, _buf: &mut BytesMut) -> Result<Option<Call>> {
+        // FIXME: Something better please
+        panic!("EOF, terminate");
     }
 }
 
