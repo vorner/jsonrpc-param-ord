@@ -4,8 +4,6 @@ extern crate bytes;
 extern crate error_chain;
 extern crate futures_await as futures;
 extern crate glob;
-#[macro_use]
-extern crate lazy_static;
 extern crate regex;
 #[macro_use]
 extern crate serde_derive;
@@ -13,8 +11,8 @@ extern crate serde_derive;
 extern crate serde_json;
 extern crate tokio_core;
 extern crate tokio_io;
-extern crate tokio_file_unix;
 extern crate tokio_process;
+extern crate tokio_stdin_stdout;
 extern crate url;
 
 use std::cell::RefCell;
@@ -34,7 +32,6 @@ use regex::Regex;
 use serde_json::Value;
 use tokio_core::reactor::{Core, Handle};
 use tokio_io::codec::{Decoder, Encoder, FramedRead, FramedWrite};
-use tokio_file_unix::{File as TokioFile, StdFile};
 use tokio_process::CommandExt;
 use url::Url;
 
@@ -136,7 +133,7 @@ impl Decoder for ContentLengthPrefixed {
                     }
                     self.re.captures_iter(&headers)
                         .next()
-                        // FIXME: Unwray because we want to kill on eof
+                        // FIXME: Unwrap because we want to kill on eof
                         .ok_or(ErrorKind::HeaderMissing).unwrap()[1]
                         .parse::<usize>()?
                 },
@@ -158,11 +155,6 @@ impl Decoder for ContentLengthPrefixed {
     }
 }
 
-lazy_static! {
-    static ref STDIN: io::Stdin = io::stdin();
-    static ref STDOUT: io::Stdout = io::stdout();
-}
-
 struct WaitingChange {
     call: Option<Call>,
     waiting: bool,
@@ -178,7 +170,6 @@ where
 {
     #[async]
     for mut call in reader {
-        /* TODO Disabled for now. Doesn't seem to work very well.
         let mut pre_call = None;
         if call.method == Some("textDocument/didChange".to_owned()) {
             let mut borrow = waiting.borrow_mut();
@@ -201,7 +192,6 @@ where
             eprintln!("Pre-send");
             writer = await!(writer.send(pre))?;
         }
-        */
         let meta = if call.method == Some("textDocument/didOpen".to_owned()) {
             let url = call.params
                 .as_ref()
@@ -276,15 +266,14 @@ where
 
 #[async]
 fn run(opts: Vec<Opts>, handle: Handle) -> Result<()> {
-    let stdin = TokioFile::new_nb(StdFile(STDIN.lock()))?
-        .into_io(&handle)?;
+    let stdin = tokio_stdin_stdout::stdin(0);
     let reader = FramedRead::new(stdin, ContentLengthPrefixed::new());
-    let stdout = TokioFile::new_nb(StdFile(STDOUT.lock()))?
-        .into_io(&handle)?;
+    let stdout = tokio_stdin_stdout::stdout(0);
     let writer = FramedWrite::new(stdout, ContentLengthPrefixed::new());
     let mut clangd = Command::new("clangd")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn_async(&handle)?;
     let clangd_writer = FramedWrite::new(clangd.stdin().take().unwrap(),
                                          ContentLengthPrefixed::new());
