@@ -2,7 +2,6 @@
 name = "jsonrpc-param-ord"
 version = "0.1.0"
 authors = ["Michal 'vorner' Vaner <vorner@vorner.cz>"]
-workspace = ".."
 license = "Apache-2.0/MIT"
 
 [dependencies]

@@ -173,6 +173,7 @@ where
 {
     #[async]
     for mut call in reader {
+        /* TODO Disabled for now. Doesn't seem to work very well.
         let mut pre_call = None;
         if call.method == Some("textDocument/didChange".to_owned()) {
             let mut borrow = waiting.borrow_mut();
@@ -195,6 +196,7 @@ where
             eprintln!("Pre-send");
             writer = await!(writer.send(pre))?;
         }
+        */
         let meta = if call.method == Some("textDocument/didOpen".to_owned()) {
             let url = call.params
                 .as_ref()
