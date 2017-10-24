@@ -3,6 +3,8 @@ extern crate bytes;
 #[macro_use]
 extern crate error_chain;
 extern crate futures_await as futures;
+#[macro_use]
+extern crate lazy_static;
 extern crate glob;
 extern crate regex;
 #[macro_use]
@@ -11,6 +13,7 @@ extern crate serde_derive;
 extern crate serde_json;
 extern crate tokio_core;
 extern crate tokio_io;
+extern crate tokio_file_unix;
 extern crate tokio_process;
 extern crate tokio_stdin_stdout;
 extern crate url;
@@ -31,6 +34,7 @@ use glob::Pattern;
 use regex::Regex;
 use serde_json::Value;
 use tokio_core::reactor::{Core, Handle};
+use tokio_file_unix::{File as TokioFile, StdFile};
 use tokio_io::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 use tokio_process::CommandExt;
 use url::Url;
@@ -264,11 +268,15 @@ where
     Ok(())
 }
 
+lazy_static! {
+    static ref STDOUT: io::Stdout = io::stdout();
+}
+
 #[async]
 fn run(opts: Vec<Opts>, handle: Handle) -> Result<()> {
     let stdin = tokio_stdin_stdout::stdin(0);
     let reader = FramedRead::new(stdin, ContentLengthPrefixed::new());
-    let stdout = tokio_stdin_stdout::stdout(0);
+    let stdout = TokioFile::new_nb(StdFile(STDOUT.lock()))?.into_io(&handle)?;
     let writer = FramedWrite::new(stdout, ContentLengthPrefixed::new());
     let mut clangd = Command::new("clangd")
         .stdin(Stdio::piped())
