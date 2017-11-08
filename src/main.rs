@@ -1,3 +1,18 @@
+extern crate jsonrpc_param_ord;
+
+use std::process;
+
+fn main() {
+    match jsonrpc_param_ord::run() {
+        Ok(()) => (),
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+    }
+}
+
+/*
 #![feature(clippy, never_type, conservative_impl_trait, generators, plugin, proc_macro)]
 extern crate bytes;
 #[macro_use]
@@ -368,3 +383,4 @@ fn main() {
         },
     }
 }
+*/
